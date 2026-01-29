@@ -1,0 +1,455 @@
+// Jenkins Agent Container Deployment Pipeline with TLS Support
+// Enhanced version with Docker TLS security
+
+def buildConfig() {
+    return [
+        // Docker image configuration
+        imageName: params.IMAGE_NAME ?: 'jenkins-ssh-agent',
+        imageTag: params.IMAGE_TAG ?: 'latest',
+        
+        // Remote Docker host configuration
+        dockerHost: params.DOCKER_HOST_IP ?: '192.168.2.7',
+        dockerPort: params.DOCKER_HOST_PORT ?: '2376',
+        
+        // TLS Configuration
+        tlsEnabled: params.TLS_ENABLED ?: true,
+        tlsCertDir: env.TLS_CERT_DIR ?: './docker-certs',
+        
+        // Agent configuration
+        numAgents: params.NUM_AGENTS ?: '1',
+        agentAction: params.AGENT_ACTION ?: 'deploy',
+        
+        // Build information
+        buildNumber: env.BUILD_NUMBER,
+        
+        // SSH Agent configuration
+        sshAgentNetwork: params.SSH_NETWORK ?: 'macvlan_net'
+    ]
+}
+
+def getDockerCommand(config) {
+    if (config.tlsEnabled) {
+        return "docker --tlsverify --tlscacert=${config.tlsCertDir}/ca.pem --tlscert=${config.tlsCertDir}/cert.pem --tlskey=${config.tlsCertDir}/key.pem -H tcp://${config.dockerHost}:${config.dockerPort}"
+    } else {
+        return "docker -H tcp://${config.dockerHost}:${config.dockerPort}"
+    }
+}
+
+def validateTlsAndConnection(config) {
+    echo "🔍 Validating Docker connection to ${config.dockerHost}:${config.dockerPort}..."
+    
+    if (config.tlsEnabled) {
+        echo "🔐 TLS encryption enabled - validating certificates..."
+        
+        sh """
+            # Check if TLS certificates exist
+            if [[ ! -f "${config.tlsCertDir}/ca.pem" ]] || [[ ! -f "${config.tlsCertDir}/cert.pem" ]] || [[ ! -f "${config.tlsCertDir}/key.pem" ]]; then
+                echo "❌ TLS certificates not found in ${config.tlsCertDir}/"
+                echo "Required files: ca.pem, cert.pem, key.pem"
+                echo ""
+                echo "To fix this:"
+                echo "1. Copy certificates from Docker host to Jenkins workspace"
+                echo "2. Or disable TLS by setting TLS_ENABLED=false"
+                exit 1
+            fi
+            
+            # Check certificate permissions
+            if [[ ! -r "${config.tlsCertDir}/key.pem" ]]; then
+                echo "❌ Cannot read private key: ${config.tlsCertDir}/key.pem"
+                echo "Fix permissions: chmod 600 ${config.tlsCertDir}/key.pem"
+                exit 1
+            fi
+            
+            echo "✅ TLS certificates found and accessible"
+        """
+    } else {
+        echo "⚠️  TLS disabled - using insecure connection"
+    }
+    
+    def dockerCmd = getDockerCommand(config)
+    
+    // Test Docker connection
+    sh "${dockerCmd} version"
+    
+    // Check if the specified image exists
+    def imageExists = sh(
+        script: "${dockerCmd} images -q ${config.imageName}:${config.imageTag}",
+        returnStdout: true
+    ).trim()
+    
+    if (!imageExists) {
+        error "❌ Docker image ${config.imageName}:${config.imageTag} not found on ${config.dockerHost}!"
+    }
+    
+    echo "✅ Docker connection validated and image found"
+    
+    if (config.tlsEnabled) {
+        echo "🔐 Connection secured with TLS encryption"
+    }
+}
+
+def deployAgents(config) {
+    echo "🚀 ${config.agentAction.capitalize()}ing ${config.numAgents} Jenkins SSH agent(s) on ${config.dockerHost}..."
+    
+    sh """
+        chmod +x tls-security/Docker-Agent-TLS.sh
+        
+        # Set environment variables
+        export DOCKER_HOST=${config.dockerHost}
+        export DOCKER_PORT=${config.dockerPort}
+        export IMAGE_NAME=${config.imageName}:${config.imageTag}
+        export NUM_AGENTS=${config.numAgents}
+        export TLS_ENABLED=${config.tlsEnabled}
+        export TLS_CERT_DIR=${config.tlsCertDir}
+        
+        # Execute the requested action using TLS-enabled script
+        case "${config.agentAction}" in
+            "deploy"|"start")
+                echo "🔄 Stopping existing agents..."
+                ./tls-security/Docker-Agent-TLS.sh stop || true
+                echo "▶️ Starting new agents..."
+                ./tls-security/Docker-Agent-TLS.sh start
+                ;;
+            "stop")
+                echo "⏹️ Stopping agents..."
+                ./tls-security/Docker-Agent-TLS.sh stop
+                ;;
+            "restart")
+                echo "🔄 Restarting agents..."
+                ./tls-security/Docker-Agent-TLS.sh restart
+                ;;
+            "status")
+                echo "📊 Checking agent status..."
+                ./tls-security/Docker-Agent-TLS.sh status
+                ;;
+            *)
+                echo "❌ Unknown action: ${config.agentAction}"
+                exit 1
+                ;;
+        esac
+    """
+}
+
+def showAgentInfo(config) {
+    echo "📋 Agent deployment summary:"
+    
+    sh """
+        export DOCKER_HOST=${config.dockerHost}
+        export DOCKER_PORT=${config.dockerPort}
+        export NUM_AGENTS=${config.numAgents}
+        export TLS_ENABLED=${config.tlsEnabled}
+        export TLS_CERT_DIR=${config.tlsCertDir}
+        
+        ./tls-security/Docker-Agent-TLS.sh status
+    """
+}
+
+def generateAgentReport(config) {
+    echo "📊 Generating agent deployment report..."
+    
+    writeFile file: 'agent-deployment-report.txt', text: """
+Jenkins SSH Agent Deployment Report
+==================================
+
+Deployment Details:
+- Action Performed: ${config.agentAction}
+- Number of Agents: ${config.numAgents}
+- Image Used: ${config.imageName}:${config.imageTag}
+- Deployment Date: ${new Date()}
+
+Docker Configuration:
+- Docker Host: ${config.dockerHost}:${config.dockerPort}
+- TLS Enabled: ${config.tlsEnabled}
+- TLS Cert Dir: ${config.tlsCertDir}
+- Network: ${config.sshAgentNetwork}
+
+Agent Configuration:
+- Base IP Range: 192.168.2.50-${192.168.2.50 + Integer.parseInt(config.numAgents) - 1}
+- SSH Port: 22
+- Username: jenkins
+- Network Type: Macvlan
+
+Security Status:
+- Docker TLS: ${config.tlsEnabled ? 'ENABLED' : 'DISABLED'}
+- SSH Key Auth: ENABLED
+- Container Isolation: ENABLED
+
+Next Steps:
+1. Configure Jenkins nodes with the agent IP addresses
+2. Use SSH username 'jenkins' with your private key
+3. Test SSH connectivity to verify agents are ready
+4. Monitor agent health and performance
+
+Troubleshooting:
+- Check agent logs: docker logs jenkins-agent[1-${config.numAgents}]
+- Test SSH: ssh -i jenkins_ssh_key jenkins@192.168.2.50
+- Verify network: ping 192.168.2.50
+"""
+    
+    archiveArtifacts artifacts: 'agent-deployment-report.txt', allowEmptyArchive: true
+}
+
+def validateNetworkConnectivity(config) {
+    if (config.agentAction in ['deploy', 'start', 'restart']) {
+        echo "🌐 Validating network connectivity to deployed agents..."
+        
+        sh """
+            # Wait for agents to fully initialize
+            sleep 10
+            
+            # Test connectivity to each agent
+            for i in \$(seq 1 ${config.numAgents}); do
+                ip="192.168.2.\$((49+i))"
+                echo "Testing connectivity to agent \$i at \$ip..."
+                
+                # Test ping connectivity
+                if ping -c 2 -W 5 \$ip >/dev/null 2>&1; then
+                    echo "✅ Ping successful to \$ip"
+                else
+                    echo "⚠️  Ping failed to \$ip - may be normal if ICMP is blocked"
+                fi
+                
+                # Test SSH port
+                if timeout 10 nc -z \$ip 22 >/dev/null 2>&1; then
+                    echo "✅ SSH port accessible on \$ip:22"
+                else
+                    echo "❌ SSH port not accessible on \$ip:22"
+                fi
+            done
+        """
+    }
+}
+
+def notifySuccess(config) {
+    echo "✅ Agent ${config.agentAction} completed successfully!"
+    echo "📊 Summary:"
+    echo "  - Action: ${config.agentAction}"
+    echo "  - Image: ${config.imageName}:${config.imageTag}"
+    echo "  - Agents: ${config.numAgents}"
+    echo "  - Docker Host: ${config.dockerHost}:${config.dockerPort}"
+    echo "  - TLS Security: ${config.tlsEnabled ? 'ENABLED' : 'DISABLED'}"
+    
+    if (config.agentAction in ['deploy', 'start', 'restart']) {
+        echo ""
+        echo "🔗 Next steps:"
+        echo "1. Configure Jenkins nodes with the displayed IP addresses"
+        echo "2. Use SSH username 'jenkins' with your private key"
+        echo "3. Test SSH connectivity to verify agents are ready"
+        echo "4. Monitor agent health and performance"
+        
+        if (config.tlsEnabled) {
+            echo ""
+            echo "🔐 Security Notes:"
+            echo "- Docker communication is TLS encrypted"
+            echo "- SSH key authentication is enabled"
+            echo "- Containers are isolated with resource limits"
+        }
+    }
+}
+
+def notifyFailure(config) {
+    echo "❌ Agent ${config.agentAction} failed!"
+    
+    // Attempt rollback for deployment failures
+    if (config.agentAction in ['deploy', 'start', 'restart']) {
+        echo "🔄 Attempting rollback..."
+        sh """
+            export DOCKER_HOST=${config.dockerHost}
+            export DOCKER_PORT=${config.dockerPort}
+            export NUM_AGENTS=${config.numAgents}
+            export TLS_ENABLED=${config.tlsEnabled}
+            export TLS_CERT_DIR=${config.tlsCertDir}
+            
+            ./tls-security/Docker-Agent-TLS.sh stop || true
+            echo "Rollback completed - all agents stopped"
+        """
+    }
+    
+    if (config.tlsEnabled) {
+        echo ""
+        echo "🔐 TLS Troubleshooting:"
+        echo "- Verify TLS certificates are present and readable"
+        echo "- Check Docker daemon TLS configuration"
+        echo "- Ensure network connectivity to ${config.dockerHost}:${config.dockerPort}"
+        echo "- Validate certificate expiration dates"
+    }
+}
+
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'AGENT_ACTION',
+            choices: ['deploy', 'start', 'stop', 'restart', 'status'],
+            description: 'Action to perform on Jenkins agents'
+        )
+        string(
+            name: 'IMAGE_NAME',
+            defaultValue: 'jenkins-ssh-agent',
+            description: 'Docker image name to use for agents'
+        )
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: 'latest',
+            description: 'Docker image tag to use'
+        )
+        string(
+            name: 'DOCKER_HOST_IP',
+            defaultValue: '192.168.2.7',
+            description: 'IP address of the remote Docker host'
+        )
+        string(
+            name: 'DOCKER_HOST_PORT',
+            defaultValue: '2376',
+            description: 'Port of the remote Docker host'
+        )
+        string(
+            name: 'NUM_AGENTS',
+            defaultValue: '1',
+            description: 'Number of Jenkins agents to manage'
+        )
+        string(
+            name: 'SSH_NETWORK',
+            defaultValue: 'macvlan_net',
+            description: 'Docker network for SSH agents'
+        )
+        booleanParam(
+            name: 'TLS_ENABLED',
+            defaultValue: true,
+            description: 'Use TLS encryption for Docker remote connection'
+        )
+        booleanParam(
+            name: 'VALIDATE_CONNECTIVITY',
+            defaultValue: true,
+            description: 'Validate network connectivity to deployed agents'
+        )
+    }
+    
+    options {
+        buildDiscarder(logRotator(daysToKeepStr: '14', numToKeepStr: '20'))
+        timeout(time: 20, unit: 'MINUTES')
+        timestamps()
+        skipDefaultCheckout()
+    }
+    
+    environment {
+        // TLS configuration
+        TLS_CERT_DIR = './docker-certs'
+        
+        // Build configuration
+        JAVA_HOME = '/opt/java/openjdk'
+        PATH = "${JAVA_HOME}/bin:${PATH}"
+    }
+    
+    stages {
+        stage('Preparation') {
+            steps {
+                script {
+                    // Clean workspace and checkout code
+                    cleanWs()
+                    checkout scm
+                    
+                    // Display parameters
+                    echo "🔧 Agent Management Parameters:"
+                    echo "  Action: ${params.AGENT_ACTION}"
+                    echo "  Image: ${params.IMAGE_NAME}:${params.IMAGE_TAG}"
+                    echo "  Docker Host: ${params.DOCKER_HOST_IP}:${params.DOCKER_HOST_PORT}"
+                    echo "  Number of Agents: ${params.NUM_AGENTS}"
+                    echo "  SSH Network: ${params.SSH_NETWORK}"
+                    echo "  TLS Enabled: ${params.TLS_ENABLED}"
+                    echo "  Validate Connectivity: ${params.VALIDATE_CONNECTIVITY}"
+                    
+                    // Set build display name
+                    currentBuild.displayName = "#${BUILD_NUMBER} - ${params.AGENT_ACTION.toUpperCase()} - ${params.NUM_AGENTS} agent(s) - TLS:${params.TLS_ENABLED}"
+                    currentBuild.description = "${params.AGENT_ACTION.capitalize()} ${params.NUM_AGENTS} Jenkins agent(s) with TLS:${params.TLS_ENABLED}"
+                }
+            }
+        }
+        
+        stage('Validate Environment') {
+            steps {
+                script {
+                    def config = buildConfig()
+                    validateTlsAndConnection(config)
+                }
+            }
+        }
+        
+        stage('Manage Agents') {
+            steps {
+                script {
+                    def config = buildConfig()
+                    deployAgents(config)
+                }
+            }
+        }
+        
+        stage('Validate Connectivity') {
+            when {
+                allOf {
+                    expression { params.AGENT_ACTION in ['deploy', 'start', 'restart'] }
+                    expression { params.VALIDATE_CONNECTIVITY == true }
+                }
+            }
+            steps {
+                script {
+                    def config = buildConfig()
+                    validateNetworkConnectivity(config)
+                }
+            }
+        }
+        
+        stage('Verify Status') {
+            when {
+                expression { params.AGENT_ACTION in ['deploy', 'start', 'restart', 'status'] }
+            }
+            steps {
+                script {
+                    def config = buildConfig()
+                    showAgentInfo(config)
+                }
+            }
+        }
+        
+        stage('Generate Report') {
+            steps {
+                script {
+                    def config = buildConfig()
+                    generateAgentReport(config)
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Archive deployment artifacts
+            archiveArtifacts artifacts: 'tls-security/Docker-Agent-TLS.sh, agent-deployment-report.txt', allowEmptyArchive: true
+            
+            // Clean workspace
+            cleanWs()
+        }
+        
+        success {
+            script {
+                def config = buildConfig()
+                notifySuccess(config)
+            }
+        }
+        
+        failure {
+            script {
+                def config = buildConfig()
+                notifyFailure(config)
+            }
+        }
+        
+        unstable {
+            script {
+                echo "⚠️ Agent management completed with warnings"
+                echo "Check the logs for details on any issues encountered"
+            }
+        }
+    }
+}

@@ -1,0 +1,474 @@
+// Jenkins SSH Agent Docker Image Build Pipeline with TLS Support
+// Enhanced version with Docker TLS security
+
+def buildConfig() {
+    return [
+        // Docker image configuration
+        imageName: env.DOCKER_IMAGE ?: 'jenkins-ssh-agent',
+        tag: env.BUILD_NUMBER,
+        
+        // DockerHub configuration
+        dockerhubRepo: params.DOCKERHUB_REPO ?: 'devopsgurupro/jenkins-docker-ssh-slave',
+        dockerhubCredentials: env.DOCKERHUB_CREDENTIALS ?: 'DOCKERHUB',
+        
+        // Remote Docker host configuration
+        dockerHost: params.DOCKER_HOST_IP ?: '192.168.2.7',
+        dockerPort: params.DOCKER_HOST_PORT ?: '2376',
+        
+        // TLS Configuration
+        tlsEnabled: params.TLS_ENABLED ?: true,
+        tlsCertDir: env.TLS_CERT_DIR ?: './docker-certs',
+        
+        // Build information
+        buildNumber: env.BUILD_NUMBER,
+        gitBranch: env.GIT_BRANCH,
+        buildType: params.BUILD_TYPE ?: 'development',
+        
+        // SSH Agent configuration
+        sshAgentNetwork: env.SSH_AGENT_NETWORK ?: 'macvlan_net'
+    ]
+}
+
+def getDockerCommand(config) {
+    if (config.tlsEnabled) {
+        return "docker --tlsverify --tlscacert=${config.tlsCertDir}/ca.pem --tlscert=${config.tlsCertDir}/cert.pem --tlskey=${config.tlsCertDir}/key.pem -H tcp://${config.dockerHost}:${config.dockerPort}"
+    } else {
+        return "docker -H tcp://${config.dockerHost}:${config.dockerPort}"
+    }
+}
+
+def validateTlsCertificates(config) {
+    if (!config.tlsEnabled) {
+        echo "⚠️  TLS disabled - using insecure connection"
+        return
+    }
+    
+    echo "🔐 Validating TLS certificates..."
+    
+    sh """
+        # Check if TLS certificates exist
+        if [[ ! -f "${config.tlsCertDir}/ca.pem" ]] || [[ ! -f "${config.tlsCertDir}/cert.pem" ]] || [[ ! -f "${config.tlsCertDir}/key.pem" ]]; then
+            echo "❌ TLS certificates not found in ${config.tlsCertDir}/"
+            echo "Required files: ca.pem, cert.pem, key.pem"
+            echo ""
+            echo "To fix this:"
+            echo "1. Copy certificates from Docker host to Jenkins workspace"
+            echo "2. Or disable TLS by setting TLS_ENABLED=false"
+            exit 1
+        fi
+        
+        # Check certificate permissions
+        if [[ ! -r "${config.tlsCertDir}/key.pem" ]]; then
+            echo "❌ Cannot read private key: ${config.tlsCertDir}/key.pem"
+            echo "Fix permissions: chmod 600 ${config.tlsCertDir}/key.pem"
+            exit 1
+        fi
+        
+        # Validate certificate expiration
+        cert_expiry=\$(openssl x509 -in "${config.tlsCertDir}/cert.pem" -noout -enddate | cut -d= -f2)
+        expiry_epoch=\$(date -d "\$cert_expiry" +%s 2>/dev/null || echo "0")
+        current_epoch=\$(date +%s)
+        
+        if [[ \$expiry_epoch -gt 0 ]]; then
+            days_until_expiry=\$(( (expiry_epoch - current_epoch) / 86400 ))
+            if [[ \$days_until_expiry -lt 30 ]]; then
+                echo "⚠️  TLS certificate expires in \$days_until_expiry days - consider renewal"
+            else
+                echo "✅ TLS certificate valid for \$days_until_expiry days"
+            fi
+        fi
+        
+        echo "✅ TLS certificates validated successfully"
+    """
+}
+
+def dockerBuild(config) {
+    echo "🐳 Building Docker image on remote host: ${config.dockerHost}"
+    
+    def dockerCmd = getDockerCommand(config)
+    
+    // Test connection to remote Docker host
+    sh "${dockerCmd} version"
+    
+    // Build the Docker image on remote host
+    sh "${dockerCmd} build -t ${config.imageName}:${config.tag} ."
+    
+    // Tag as latest
+    sh "${dockerCmd} tag ${config.imageName}:${config.tag} ${config.imageName}:latest"
+    
+    echo "✅ Docker image built successfully on ${config.dockerHost}"
+}
+
+def dockerTest(config) {
+    echo "🧪 Testing Docker image functionality on ${config.dockerHost}..."
+    
+    def dockerCmd = getDockerCommand(config)
+    
+    sh """
+        # Create test container on remote host
+        ${dockerCmd} run -d --name test-jenkins-agent-${config.buildNumber} \\
+            -p 2299:22 \\
+            ${config.imageName}:${config.tag}
+        
+        # Wait for container to start
+        sleep 10
+        
+        # Check if SSH service is running
+        ${dockerCmd} exec test-jenkins-agent-${config.buildNumber} ss -tuln | grep :22
+        
+        # Check Java installation
+        ${dockerCmd} exec test-jenkins-agent-${config.buildNumber} java -version
+        
+        # Check Ansible installation
+        ${dockerCmd} exec test-jenkins-agent-${config.buildNumber} ansible --version
+        
+        # Test container health
+        health_status=\$(${dockerCmd} inspect --format='{{.State.Health.Status}}' test-jenkins-agent-${config.buildNumber} 2>/dev/null || echo "none")
+        echo "Container health status: \$health_status"
+        
+        # Cleanup test container
+        ${dockerCmd} rm -f test-jenkins-agent-${config.buildNumber}
+    """
+    
+    echo "✅ Docker image tests passed"
+}
+
+def securityScan(config) {
+    echo "🔍 Running security scan on Docker image..."
+    
+    def dockerCmd = getDockerCommand(config)
+    
+    sh """
+        # Check if trivy is available
+        if command -v trivy &> /dev/null; then
+            echo "Running Trivy security scan..."
+            
+            # Save image from remote host and scan locally
+            ${dockerCmd} save ${config.imageName}:${config.tag} | docker load
+            
+            # Run security scan
+            trivy image --exit-code 0 --severity HIGH,CRITICAL --format table ${config.imageName}:${config.tag}
+            
+            # Generate JSON report
+            trivy image --exit-code 0 --severity HIGH,CRITICAL --format json -o security-report.json ${config.imageName}:${config.tag}
+            
+            echo "✅ Security scan completed"
+        else
+            echo "⚠️  Trivy not found, skipping security scan"
+            echo "Consider installing Trivy for security scanning"
+        fi
+    """
+}
+
+def pushToRegistry(config) {
+    echo "📤 Pushing Docker image to DockerHub repository: ${config.dockerhubRepo}"
+    
+    def dockerCmd = getDockerCommand(config)
+    
+    // Tag image for DockerHub
+    sh "${dockerCmd} tag ${config.imageName}:${config.tag} ${config.dockerhubRepo}:${config.tag}"
+    sh "${dockerCmd} tag ${config.imageName}:${config.tag} ${config.dockerhubRepo}:latest"
+    
+    // Push to DockerHub
+    withCredentials([usernamePassword(credentialsId: "${config.dockerhubCredentials}", 
+                                    passwordVariable: 'DOCKER_PASSWORD', 
+                                    usernameVariable: 'DOCKER_USERNAME')]) {
+        sh """
+            # Login to DockerHub on remote host
+            echo \$DOCKER_PASSWORD | ${dockerCmd} login -u \$DOCKER_USERNAME --password-stdin
+            
+            # Push tagged images
+            ${dockerCmd} push ${config.dockerhubRepo}:${config.tag}
+            ${dockerCmd} push ${config.dockerhubRepo}:latest
+            
+            # Logout for security
+            ${dockerCmd} logout
+        """
+    }
+    
+    echo "✅ Successfully pushed to DockerHub:"
+    echo "  - ${config.dockerhubRepo}:${config.tag}"
+    echo "  - ${config.dockerhubRepo}:latest"
+}
+
+def cleanupImages(config) {
+    echo "🧹 Cleaning up build artifacts..."
+    
+    def dockerCmd = getDockerCommand(config)
+    
+    sh """
+        # Remove old build images (keep last 5)
+        ${dockerCmd} images ${config.imageName} --format "table {{.Tag}}" | \\
+        grep -E '^[0-9]+\$' | \\
+        sort -nr | \\
+        tail -n +6 | \\
+        xargs -I {} ${dockerCmd} rmi ${config.imageName}:{} || true
+        
+        # Clean up dangling images
+        ${dockerCmd} image prune -f || true
+    """
+}
+
+def generateDeploymentInfo(config) {
+    echo "📋 Generating deployment information..."
+    
+    writeFile file: 'deployment-info.txt', text: """
+Jenkins SSH Agent Docker Image Build Information
+==============================================
+
+Build Details:
+- Build Number: ${config.buildNumber}
+- Image Name: ${config.imageName}:${config.tag}
+- Build Type: ${config.buildType}
+- Git Branch: ${config.gitBranch}
+- Build Date: ${new Date()}
+
+Docker Configuration:
+- Docker Host: ${config.dockerHost}:${config.dockerPort}
+- TLS Enabled: ${config.tlsEnabled}
+- TLS Cert Dir: ${config.tlsCertDir}
+
+Registry Information:
+- DockerHub Repo: ${config.dockerhubRepo}
+- Image Tags: ${config.tag}, latest
+
+Next Steps:
+1. Use the 'Agent Deploy' pipeline to deploy containers
+2. Specify image: ${config.imageName}:${config.tag}
+3. Configure number of agents as needed
+
+Security Notes:
+- TLS encryption: ${config.tlsEnabled ? 'ENABLED' : 'DISABLED'}
+- Certificate location: ${config.tlsCertDir}
+- Rotate certificates every 365 days
+"""
+    
+    archiveArtifacts artifacts: 'deployment-info.txt', allowEmptyArchive: true
+}
+
+def notifySuccess(config) {
+    echo "✅ Pipeline completed successfully!"
+    echo "🐳 Docker image ${config.imageName}:${config.tag} built and ready"
+    echo "🔐 TLS Security: ${config.tlsEnabled ? 'ENABLED' : 'DISABLED'}"
+    echo ""
+    echo "📋 Next steps:"
+    echo "1. Use the 'Agent Deploy' pipeline to deploy containers"
+    echo "2. Configure Jenkins nodes with the deployed agent IPs"
+    echo "3. Test SSH connectivity to verify agents are ready"
+}
+
+def notifyFailure(config) {
+    echo "❌ Pipeline failed!"
+    echo "🔍 Check the logs above for detailed error information"
+    
+    if (config.tlsEnabled) {
+        echo ""
+        echo "🔐 TLS Troubleshooting:"
+        echo "- Verify TLS certificates are present and readable"
+        echo "- Check Docker daemon TLS configuration"
+        echo "- Ensure network connectivity to ${config.dockerHost}:${config.dockerPort}"
+    }
+}
+
+pipeline {
+    agent any
+    
+    parameters {
+        string(
+            name: 'DOCKER_HOST_IP',
+            defaultValue: '192.168.2.7',
+            description: 'IP address of the remote Docker host'
+        )
+        string(
+            name: 'DOCKER_HOST_PORT',
+            defaultValue: '2376',
+            description: 'Port of the remote Docker host'
+        )
+        string(
+            name: 'DOCKERHUB_REPO',
+            defaultValue: 'devopsgurupro/jenkins-docker-ssh-slave',
+            description: 'DockerHub repository name'
+        )
+        choice(
+            name: 'BUILD_TYPE',
+            choices: ['development', 'staging', 'production'],
+            description: 'Build environment type'
+        )
+        booleanParam(
+            name: 'TLS_ENABLED',
+            defaultValue: true,
+            description: 'Use TLS encryption for Docker remote connection'
+        )
+        booleanParam(
+            name: 'PUSH_TO_REGISTRY',
+            defaultValue: true,
+            description: 'Push image to DockerHub registry'
+        )
+        booleanParam(
+            name: 'RUN_SECURITY_SCAN',
+            defaultValue: true,
+            description: 'Run security scan on the built image'
+        )
+    }
+    
+    options {
+        buildDiscarder(logRotator(daysToKeepStr: '7', numToKeepStr: '10'))
+        timeout(time: 45, unit: 'MINUTES')
+        timestamps()
+        skipDefaultCheckout()
+    }
+    
+    environment {
+        // Docker image configuration
+        DOCKER_IMAGE = 'jenkins-ssh-agent'
+        DOCKER_TAG = "${BUILD_NUMBER}"
+        
+        // DockerHub configuration
+        DOCKERHUB_REPO = "${params.DOCKERHUB_REPO}"
+        DOCKERHUB_CREDENTIALS = 'DOCKERHUB'
+        
+        // TLS configuration
+        TLS_CERT_DIR = './docker-certs'
+        
+        // SSH Agent configuration
+        SSH_AGENT_NETWORK = 'macvlan_net'
+        
+        // Build configuration
+        JAVA_HOME = '/opt/java/openjdk'
+        PATH = "${JAVA_HOME}/bin:${PATH}"
+    }
+    
+    stages {
+        stage('Preparation') {
+            steps {
+                script {
+                    // Clean workspace and checkout code
+                    cleanWs()
+                    checkout scm
+                    
+                    // Display build parameters
+                    echo "🔧 Build Parameters:"
+                    echo "  Docker Host: ${params.DOCKER_HOST_IP}:${params.DOCKER_HOST_PORT}"
+                    echo "  DockerHub Repo: ${params.DOCKERHUB_REPO}"
+                    echo "  Build Type: ${params.BUILD_TYPE}"
+                    echo "  TLS Enabled: ${params.TLS_ENABLED}"
+                    echo "  Push to Registry: ${params.PUSH_TO_REGISTRY}"
+                    echo "  Security Scan: ${params.RUN_SECURITY_SCAN}"
+                    
+                    // Set build display name
+                    currentBuild.displayName = "#${BUILD_NUMBER} - ${params.BUILD_TYPE} - TLS:${params.TLS_ENABLED}"
+                    currentBuild.description = "Building Jenkins SSH Agent with TLS:${params.TLS_ENABLED} for ${params.BUILD_TYPE}"
+                }
+            }
+        }
+        
+        stage('Validate TLS Certificates') {
+            when {
+                expression { params.TLS_ENABLED == true }
+            }
+            steps {
+                script {
+                    def config = buildConfig()
+                    validateTlsCertificates(config)
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def config = buildConfig()
+                    dockerBuild(config)
+                }
+            }
+        }
+        
+        stage('Test Docker Image') {
+            steps {
+                script {
+                    def config = buildConfig()
+                    dockerTest(config)
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            when {
+                expression { params.RUN_SECURITY_SCAN == true }
+            }
+            steps {
+                script {
+                    def config = buildConfig()
+                    securityScan(config)
+                }
+            }
+            post {
+                always {
+                    // Archive security report if it exists
+                    archiveArtifacts artifacts: 'security-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('Push to Registry') {
+            when {
+                expression { params.PUSH_TO_REGISTRY == true }
+            }
+            steps {
+                script {
+                    def config = buildConfig()
+                    pushToRegistry(config)
+                }
+            }
+        }
+        
+        stage('Generate Deployment Info') {
+            steps {
+                script {
+                    def config = buildConfig()
+                    generateDeploymentInfo(config)
+                }
+            }
+        }
+        
+        stage('Cleanup') {
+            steps {
+                script {
+                    def config = buildConfig()
+                    cleanupImages(config)
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Archive build artifacts (excluding private keys)
+            archiveArtifacts artifacts: 'Dockerfile, .ssh/jenkins_ssh_key.pub, deployment-info.txt', allowEmptyArchive: true
+            
+            // Clean workspace
+            cleanWs()
+        }
+        
+        success {
+            script {
+                def config = buildConfig()
+                notifySuccess(config)
+            }
+        }
+        
+        failure {
+            script {
+                def config = buildConfig()
+                notifyFailure(config)
+            }
+        }
+        
+        unstable {
+            script {
+                echo "⚠️ Pipeline completed with warnings"
+                echo "Check the logs for details on any issues encountered"
+            }
+        }
+    }
+}

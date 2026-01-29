@@ -1,0 +1,278 @@
+// Jenkins Pipeline with Flexible Network Configuration
+// Supports multiple network topologies and environments
+
+def loadNetworkConfig(environment) {
+    return [
+        // Environment-specific configuration
+        environment: environment,
+        configFile: "flexible-network/environment-configs/${environment.toLowerCase()}.env",
+        
+        // Docker configuration
+        dockerHost: params.DOCKER_HOST_IP ?: getEnvDefault(environment, 'DOCKER_HOST_IP', '192.168.2.7'),
+        dockerPort: params.DOCKER_HOST_PORT ?: getEnvDefault(environment, 'DOCKER_HOST_PORT', '2376'),
+        
+        // Network configuration
+        networkType: params.NETWORK_TYPE ?: getEnvDefault(environment, 'NETWORK_TYPE', 'macvlan'),
+        networkName: params.NETWORK_NAME ?: getEnvDefault(environment, 'NETWORK_NAME', 'jenkins_net'),
+        
+        // Agent configuration
+        numAgents: params.NUM_AGENTS ?: getEnvDefault(environment, 'NUM_AGENTS', '1'),
+        agentAction: params.AGENT_ACTION ?: 'deploy',
+        
+        // TLS configuration
+        tlsEnabled: params.TLS_ENABLED ?: getEnvDefault(environment, 'TLS_ENABLED', 'true'),
+        tlsCertDir: env.TLS_CERT_DIR ?: './docker-certs',
+        
+        // Build information
+        buildNumber: env.BUILD_NUMBER,
+        imageName: params.IMAGE_NAME ?: 'jenkins-ssh-agent'
+    ]
+}
+
+def getEnvDefault(environment, key, defaultValue) {
+    // Environment-specific defaults
+    def envDefaults = [
+        'DEV': [
+            'DOCKER_HOST_IP': '192.168.1.100',
+            'NETWORK_TYPE': 'bridge',
+            'NUM_AGENTS': '1',
+            'TLS_ENABLED': 'false'
+        ],
+        'STAGING': [
+            'DOCKER_HOST_IP': '10.0.1.50',
+            'NETWORK_TYPE': 'macvlan',
+            'NUM_AGENTS': '3',
+            'TLS_ENABLED': 'true'
+        ],
+        'PROD': [
+            'DOCKER_HOST_IP': '10.0.2.100',
+            'NETWORK_TYPE': 'overlay',
+            'NUM_AGENTS': '10',
+            'TLS_ENABLED': 'true'
+        ]
+    ]
+    
+    return envDefaults[environment]?[key] ?: defaultValue
+}
+
+def validateNetworkConfig(config) {
+    echo "🔍 Validating network configuration for ${config.environment}..."
+    
+    sh """
+        chmod +x flexible-network/network-manager.sh
+        
+        # Set environment variables
+        export CONFIG_FILE=${config.configFile}
+        export ENVIRONMENT=${config.environment}
+        export DOCKER_HOST_IP=${config.dockerHost}
+        export DOCKER_PORT=${config.dockerPort}
+        export NETWORK_TYPE=${config.networkType}
+        export TLS_ENABLED=${config.tlsEnabled}
+        
+        # Validate configuration
+        ./flexible-network/network-manager.sh validate
+    """
+}
+
+def deployAgentsFlexible(config) {
+    echo "🚀 Deploying agents with flexible network configuration..."
+    
+    sh """
+        chmod +x flexible-network/Docker-Agent-Flexible.sh
+        
+        # Set environment variables
+        export CONFIG_FILE=${config.configFile}
+        export ENVIRONMENT=${config.environment}
+        export DOCKER_HOST_IP=${config.dockerHost}
+        export DOCKER_PORT=${config.dockerPort}
+        export NETWORK_TYPE=${config.networkType}
+        export NETWORK_NAME=${config.networkName}
+        export NUM_AGENTS=${config.numAgents}
+        export TLS_ENABLED=${config.tlsEnabled}
+        export TLS_CERT_DIR=${config.tlsCertDir}
+        export IMAGE_NAME=${config.imageName}
+        
+        # Execute deployment
+        case "${config.agentAction}" in
+            "deploy"|"start")
+                ./flexible-network/Docker-Agent-Flexible.sh start
+                ;;
+            "stop")
+                ./flexible-network/Docker-Agent-Flexible.sh stop
+                ;;
+            "restart")
+                ./flexible-network/Docker-Agent-Flexible.sh restart
+                ;;
+            "status")
+                ./flexible-network/Docker-Agent-Flexible.sh status
+                ;;
+        esac
+    """
+}
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['DEV', 'STAGING', 'PROD'],
+            description: 'Target environment for deployment'
+        )
+        choice(
+            name: 'AGENT_ACTION',
+            choices: ['deploy', 'start', 'stop', 'restart', 'status'],
+            description: 'Action to perform on Jenkins agents'
+        )
+        choice(
+            name: 'NETWORK_TYPE',
+            choices: ['auto', 'macvlan', 'bridge', 'overlay', 'host'],
+            description: 'Network type (auto uses environment default)'
+        )
+        string(
+            name: 'DOCKER_HOST_IP',
+            defaultValue: '',
+            description: 'Docker host IP (leave empty for environment default)'
+        )
+        string(
+            name: 'NUM_AGENTS',
+            defaultValue: '',
+            description: 'Number of agents (leave empty for environment default)'
+        )
+        string(
+            name: 'IMAGE_NAME',
+            defaultValue: 'jenkins-ssh-agent',
+            description: 'Docker image name to use'
+        )
+        booleanParam(
+            name: 'TLS_ENABLED',
+            defaultValue: null,
+            description: 'Enable TLS (null uses environment default)'
+        )
+        booleanParam(
+            name: 'VALIDATE_NETWORK',
+            defaultValue: true,
+            description: 'Validate network configuration before deployment'
+        )
+    }
+    
+    options {
+        buildDiscarder(logRotator(daysToKeepStr: '14', numToKeepStr: '20'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+        skipDefaultCheckout()
+    }
+    
+    environment {
+        TLS_CERT_DIR = './docker-certs'
+    }
+    
+    stages {
+        stage('Preparation') {
+            steps {
+                script {
+                    cleanWs()
+                    checkout scm
+                    
+                    echo "🔧 Flexible Network Deployment Parameters:"
+                    echo "  Environment: ${params.ENVIRONMENT}"
+                    echo "  Action: ${params.AGENT_ACTION}"
+                    echo "  Network Type: ${params.NETWORK_TYPE}"
+                    echo "  Docker Host: ${params.DOCKER_HOST_IP ?: 'Environment Default'}"
+                    echo "  Number of Agents: ${params.NUM_AGENTS ?: 'Environment Default'}"
+                    echo "  Image: ${params.IMAGE_NAME}"
+                    echo "  TLS Enabled: ${params.TLS_ENABLED ?: 'Environment Default'}"
+                    
+                    currentBuild.displayName = "#${BUILD_NUMBER} - ${params.ENVIRONMENT} - ${params.AGENT_ACTION} - ${params.NETWORK_TYPE}"
+                    currentBuild.description = "${params.AGENT_ACTION} agents in ${params.ENVIRONMENT} with ${params.NETWORK_TYPE} network"
+                }
+            }
+        }
+        
+        stage('Load Configuration') {
+            steps {
+                script {
+                    def config = loadNetworkConfig(params.ENVIRONMENT)
+                    env.NETWORK_CONFIG = writeJSON returnText: true, json: config
+                    
+                    echo "📋 Loaded Configuration:"
+                    echo "  Environment: ${config.environment}"
+                    echo "  Docker Host: ${config.dockerHost}:${config.dockerPort}"
+                    echo "  Network: ${config.networkType}/${config.networkName}"
+                    echo "  Agents: ${config.numAgents}"
+                    echo "  TLS: ${config.tlsEnabled}"
+                }
+            }
+        }
+        
+        stage('Validate Network') {
+            when {
+                expression { params.VALIDATE_NETWORK == true }
+            }
+            steps {
+                script {
+                    def config = readJSON text: env.NETWORK_CONFIG
+                    validateNetworkConfig(config)
+                }
+            }
+        }
+        
+        stage('Deploy Agents') {
+            steps {
+                script {
+                    def config = readJSON text: env.NETWORK_CONFIG
+                    deployAgentsFlexible(config)
+                }
+            }
+        }
+        
+        stage('Verify Deployment') {
+            when {
+                expression { params.AGENT_ACTION in ['deploy', 'start', 'restart'] }
+            }
+            steps {
+                script {
+                    def config = readJSON text: env.NETWORK_CONFIG
+                    
+                    sh """
+                        export CONFIG_FILE=${config.configFile}
+                        export ENVIRONMENT=${config.environment}
+                        
+                        # Show deployment status
+                        ./flexible-network/Docker-Agent-Flexible.sh status
+                        
+                        # Test network connectivity
+                        ./flexible-network/network-manager.sh test-connectivity
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            archiveArtifacts artifacts: 'flexible-network/**', allowEmptyArchive: true
+            cleanWs()
+        }
+        
+        success {
+            script {
+                def config = readJSON text: env.NETWORK_CONFIG
+                echo "✅ Flexible network deployment completed successfully!"
+                echo "📊 Summary:"
+                echo "  Environment: ${config.environment}"
+                echo "  Action: ${config.agentAction}"
+                echo "  Network Type: ${config.networkType}"
+                echo "  Agents: ${config.numAgents}"
+                echo "  Docker Host: ${config.dockerHost}:${config.dockerPort}"
+                echo "  TLS Security: ${config.tlsEnabled}"
+            }
+        }
+        
+        failure {
+            script {
+                echo "❌ Flexible network deployment failed!"
+                echo "Check the logs above for detailed error information"
+            }
+        }
+    }
+}
